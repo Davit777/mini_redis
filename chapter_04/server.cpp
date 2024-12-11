@@ -10,7 +10,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <string>
 #include <vector>
+#include <map>
 
 #define HEADER_SIZE           4
 
@@ -24,6 +26,13 @@ enum
     STATE_END = 2,
 };
 
+enum
+{
+    RES_OK  = 0,
+    RES_ERR = 1,
+    RES_NX  = 2,
+};
+
 struct Connection
 {
     int fd;
@@ -34,6 +43,9 @@ struct Connection
     size_t wbuf_sent;
     uint8_t wbuf[HEADER_SIZE + MAX_MESSAGE_SIZE];
 };
+
+// placeholder for hashtable
+static std::map<std::string, std::string> g_map;
 
 static inline void msg(const char* msg)
 {
@@ -52,14 +64,13 @@ static inline void die(const char* msg)
 static inline void fd_set_nb(const int fd)
 {
     errno = 0;
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (0 != errno) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (errno) {
         die("fcntl error");
     }
-    flags |= O_NONBLOCK;
     errno = 0;
-    (void)fcntl(fd, F_SETFL, flags);
-    if (0 != errno) {
+    (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (errno) {
         die("fcntl error");
     }
 }
@@ -72,35 +83,120 @@ static inline void connection_put(std::vector<Connection*>& fd2connection, struc
     fd2connection[connection->fd] = connection;
 }
 
-static inline int32_t accept_new_connection(std::vector<Connection*>& fd2connection, const int fd)
+static inline size_t accept_new_connection(std::vector<Connection*>& fd2connection, const int fd)
 {
     struct sockaddr_in client_addr = {};
     socklen_t socklen = sizeof(client_addr);
-    const int connectfd = accept(fd, (struct sockaddr*)&client_addr, &socklen);
-    if (connectfd < 0) {
+    const int connfd = accept(fd, (struct sockaddr *)&client_addr, &socklen);
+    if (connfd < 0) {
         msg("accept() error");
+        return -1;
     }
-
-    fd_set_nb(connectfd);
-
+    fd_set_nb(connfd);
     struct Connection* connection = (struct Connection*)malloc(sizeof(struct Connection));
     if (NULL == connection) {
-        close(connectfd);
+        close(connfd);
+        return -1;
     }
-    connection->fd = connectfd;
+    connection->fd = connfd;
     connection->state = STATE_REQ;
     connection->rbuf_size = 0;
     connection->wbuf_size = 0;
     connection->wbuf_sent = 0;
     connection_put(fd2connection, connection);
-
     return 0;
 }
 
 static inline void state_req(Connection* connection);
 static inline void state_res(Connection* connection);
 
-static inline bool try_one_request(Connection* connection)
+static int32_t parse_req(const uint8_t* data, size_t len, std::vector<std::string>& out)
+{
+    if (len < HEADER_SIZE) {
+        return -1;
+    }
+    uint32_t n = 0;
+    memcpy(&n, &data[0], HEADER_SIZE);
+    if (n > MAX_MESSAGE_SIZE) {
+        return -1;
+    }
+
+    size_t pos = HEADER_SIZE;
+    while (n--) {
+        if (pos + HEADER_SIZE > len) {
+            return -1;
+        }
+        uint32_t sz = 0;
+        memcpy(&sz, &data[pos], HEADER_SIZE);
+        if (pos + HEADER_SIZE + sz > len) {
+            return -1;
+        }
+        out.push_back(std::string((char*)&data[pos + HEADER_SIZE], sz));
+        pos += HEADER_SIZE + sz;
+    }
+    if (pos != len) {
+        return -1;
+    }
+    return 0;
+}
+
+static inline uint32_t do_get(const std::vector<std::string>& cmd, uint8_t* res, uint32_t* reslen)
+{
+    if (!g_map.count(cmd[1])) {
+        return RES_NX;
+    }
+    std::string& val = g_map[cmd[1]];
+    assert(val.size() <= MAX_MESSAGE_SIZE);
+    memcpy(res, val.data(), val.size());
+    *reslen = (uint32_t)val.size();
+    return RES_OK;
+}
+
+static inline uint32_t do_set(const std::vector<std::string>& cmd, uint8_t* res, uint32_t* reslen)
+{
+    (void)res;
+    (void)reslen;
+    g_map[cmd[1]] = cmd[2];
+    return RES_OK;
+}
+
+static uint32_t do_del(const std::vector<std::string>& cmd, uint8_t* res, uint32_t* reslen)
+{
+    (void)res;
+    (void)reslen;
+    g_map.erase(cmd[1]);
+    return RES_OK;
+}
+
+static inline bool cmd_is(const std::string& word, const char* cmd)
+{
+    return 0 == strcasecmp(word.c_str(), cmd);
+}
+
+static int32_t do_request(const uint8_t* req, uint32_t reqlen, uint32_t* rescode, uint8_t* res, uint32_t* reslen)
+{
+    std::vector<std::string> cmd;
+    if (0 != parse_req(req, reqlen, cmd)) {
+        msg("bad req");
+        return -1;
+    }
+    if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
+        *rescode = do_get(cmd, res, reslen);
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
+        *rescode = do_set(cmd, res, reslen);
+    } else if(cmd.size() == 2 && cmd_is(cmd[0], "del")) {
+        *rescode = do_del(cmd, res, reslen);
+    } else {
+        *rescode = RES_ERR;
+        const char* msg = "Unown cmd";
+        strcpy((char*)res, msg);
+        *reslen = strlen(msg);
+        return 0;
+    }
+    return 0;
+}
+
+static bool try_one_request(Connection* connection)
 {
     if (connection->rbuf_size < HEADER_SIZE) {
         return false;
@@ -117,24 +213,29 @@ static inline bool try_one_request(Connection* connection)
         return false;
     }
 
-    printf("client says: %.*s\n", len, &connection->rbuf[4]);
+    uint32_t rescode = 0;
+    uint32_t wlen = 0;
+    int32_t err = do_request(&connection->rbuf[HEADER_SIZE], len, &rescode, &connection->wbuf[HEADER_SIZE + HEADER_SIZE], &wlen);
+    if (err) {
+        connection->state = STATE_END;
+        return false;
+    }
+    wlen += HEADER_SIZE;
+    memcpy(&connection->wbuf[0], &wlen, HEADER_SIZE);
+    memcpy(&connection->wbuf[HEADER_SIZE], &rescode, HEADER_SIZE);
+    connection->wbuf_size = HEADER_SIZE + wlen;
 
-    memcpy(&connection->wbuf[0], &len, HEADER_SIZE);
-    memcpy(&connection->wbuf[HEADER_SIZE], &connection->rbuf[HEADER_SIZE], len);
-    connection->wbuf_size = HEADER_SIZE + len;
-
-    const size_t remain = connection->rbuf_size - HEADER_SIZE - len;
+    size_t remain = connection->rbuf_size - HEADER_SIZE - len;
     if (remain) {
         memmove(connection->rbuf, &connection->rbuf[HEADER_SIZE + len], remain);
     }
     connection->rbuf_size = remain;
-
     connection->state = STATE_RES;
     state_res(connection);
-    return (connection->state == STATE_REQ);
+    return (connection->state = STATE_REQ);
 }
 
-static inline bool try_fill_buffer(Connection* connection)
+static inline bool try_full_buffer(Connection* connection)
 {
     assert(connection->rbuf_size < sizeof(connection->rbuf));
     ssize_t rv = 0;
@@ -142,7 +243,6 @@ static inline bool try_fill_buffer(Connection* connection)
         const size_t capacity = sizeof(connection->rbuf) - connection->rbuf_size;
         rv = read(connection->fd, &connection->rbuf[connection->rbuf_size], capacity);
     } while (rv < 0 && errno == EINTR);
-
     if (rv < 0 && errno == EAGAIN) {
         return false;
     }
@@ -154,8 +254,6 @@ static inline bool try_fill_buffer(Connection* connection)
     if (0 == rv) {
         if (connection->rbuf_size > 0) {
             msg("unexpected EOF");
-        } else {
-            msg("EOF");
         }
         connection->state = STATE_END;
         return false;
@@ -170,7 +268,7 @@ static inline bool try_fill_buffer(Connection* connection)
 
 static inline void state_req(Connection* connection)
 {
-    while (try_fill_buffer(connection));
+    while (try_full_buffer(connection));
 }
 
 static inline bool try_flush_buffer(Connection* connection)
@@ -179,11 +277,11 @@ static inline bool try_flush_buffer(Connection* connection)
     do {
         const size_t remain = connection->wbuf_size - connection->wbuf_sent;
         rv = write(connection->fd, &connection->wbuf[connection->wbuf_sent], remain);
-    } while (rv < 0 || errno == EINTR);
+    } while (rv < 0 && errno == EINTR);
     if (rv < 0 && errno == EAGAIN) {
         return false;
     }
-    if (rv < 0) {
+    if (rv < 0){
         msg("write() error");
         connection->state = STATE_END;
         return false;
@@ -217,9 +315,9 @@ static inline void connection_io(Connection* connection)
 
 int main()
 {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        die("socket");
+        die("socket()");
     }
 
     const int val = 1;
@@ -229,13 +327,13 @@ int main()
     addr.sin_family = AF_INET;
     addr.sin_port = ntohs(1234);
     addr.sin_addr.s_addr = ntohl(0);
-    int rv = bind(fd, (const struct sockaddr*)&addr, sizeof(addr));
-    if (0 != rv) {
+    int rv = bind(fd, (const sockaddr *)&addr, sizeof(addr));
+    if (rv) {
         die("bind()");
     }
 
     rv = listen(fd, SOMAXCONN);
-    if (0 != rv) {
+    if (rv) {
         die("listen");
     }
 
@@ -246,36 +344,39 @@ int main()
     std::vector<struct pollfd> poll_args;
     while (true) {
         poll_args.clear();
-        const struct pollfd pfd = {fd, POLLIN, 0};
+        struct pollfd pfd = {fd, POLLIN, 0};
         poll_args.push_back(pfd);
         for (size_t i = 0; i < fd2connection.size(); ++i) {
             Connection* connection = fd2connection[i];
             if (NULL == connection) continue;
-            struct pollfd connection_pfd = {};
-            connection_pfd.fd = connection->fd;
-            connection_pfd.events = (connection->state == STATE_REQ) ? POLLIN : POLLOUT;
-            connection_pfd.events |= POLLERR;
-            poll_args.push_back(connection_pfd);
+            struct pollfd pfd = {};
+            pfd.fd = connection->fd;
+            pfd.events = (connection->state == STATE_REQ) ? POLLIN : POLLOUT;
+            pfd.events = pfd.events | POLLERR;
+            poll_args.push_back(pfd);
         }
+
         const int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
         if (rv < 0) {
-            die("poll()");
+            die("poll");
         }
+
         for (size_t i = 1; i < poll_args.size(); ++i) {
-            if (!poll_args[i].revents) continue;
-            Connection* connection = fd2connection[poll_args[i].fd];
-            connection_io(connection);
-            if (connection->state == STATE_END) {
-                fd2connection[connection->fd] = NULL;
-                close(connection->fd);
-                free(connection);
+            if (poll_args[i].revents) {
+                Connection* connection = fd2connection[poll_args[i].fd];
+                connection_io(connection);
+                if (connection->state == STATE_END) {
+                    fd2connection[connection->fd] = NULL;
+                    (void)close(connection->fd);
+                    free(connection);
+                }
             }
         }
+
         if (poll_args[0].revents) {
-            accept_new_connection(fd2connection, fd);
+            (void)accept_new_connection(fd2connection, fd);
         }
     }
 
     return 0;
 }
-
